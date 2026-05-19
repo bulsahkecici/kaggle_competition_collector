@@ -1,0 +1,36 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# kaggle_competition_collector — example config.yaml
+#
+# All values here are the defaults.
+# CLI flags always override config.yaml.
+# Usage: python main.py --config config.yaml
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Competition to collect (required unless passed via --competition)
+competition_slug: ""
+
+# Root output directory.  A "latest/" subfolder is written here;
+# a timestamped copy goes into "archives/".
+output_dir: "./competition_archive"
+
+# ── Collection toggles ────────────────────────────────────────────────────────
+download_data: true          # Download competition data files
+collect_screenshots: true    # Full-page PNG screenshots for each tab
+collect_notebooks: true      # Public notebook collection
+collect_discussions: true    # Deep discussion thread collection
+profile_data: true           # Auto-profile CSV / Parquet / etc. files
+
+# ── Limits ────────────────────────────────────────────────────────────────────
+max_notebooks: 15            # Max notebooks to collect
+max_discussion_threads: 25   # Max discussion threads to collect
+
+# ── Browser ───────────────────────────────────────────────────────────────────
+headless_browser: true       # Set to false to see the browser window
+
+# Tabs to skip (leave empty to collect all):
+#   overview | data | evaluation | rules | leaderboard | discussion | code
+skip_tabs: []
+
+# ── Behaviour ─────────────────────────────────────────────────────────────────
+polite_delay_seconds: 2.5    # Seconds to wait between browser page requests
+overwrite_cache: false       # Re-download files even if unchanged

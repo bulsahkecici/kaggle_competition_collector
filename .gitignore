@@ -1,0 +1,35 @@
+# Secrets and local credentials
+.env
+.kaggle/
+kaggle.json
+browser_state.json
+chromium_profile/
+
+# Generated competition outputs and archives
+competition_archive/
+outputs/
+archives/
+latest/
+*.zip
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Logs
+*.log

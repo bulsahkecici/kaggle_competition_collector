@@ -1,0 +1,17 @@
+# ── Core ──────────────────────────────────────────────────────────────────────
+kaggle>=1.6.17
+playwright>=1.44.0
+python-dotenv>=1.0.1
+
+# ── HTML → Markdown conversion ────────────────────────────────────────────────
+markdownify>=0.12.1
+beautifulsoup4>=4.12.3
+lxml>=5.2.2
+
+# ── Data profiling ────────────────────────────────────────────────────────────
+pandas>=2.2.0
+pyarrow>=16.0.0          # Parquet / Feather support
+openpyxl>=3.1.2          # XLSX support
+
+# ── Config ────────────────────────────────────────────────────────────────────
+pyyaml>=6.0.1
