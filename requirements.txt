@@ -2,6 +2,7 @@
 kaggle>=1.6.17
 playwright>=1.44.0
 python-dotenv>=1.0.1
+streamlit>=1.50.0
 
 # ── HTML → Markdown conversion ────────────────────────────────────────────────
 markdownify>=0.12.1
