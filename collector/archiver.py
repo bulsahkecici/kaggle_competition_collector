@@ -2,17 +2,20 @@
 Run-level archiving, SHA-256 caching, and structured log management.
 
 Creates:
-  <base_dir>/<slug>/latest/          ← live results for this competition
-  <base_dir>/<slug>/archives/<slug>_YYYYMMDD_HHMMSS/  ← immutable snapshot
+  <base_dir>/<slug>/latest/                 live results
+  <base_dir>/<slug>/archives/<timestamp>/   immutable snapshot
+  <base_dir>/<slug>/archives/<run_id>.zip   portable archive
 
-All collectors write to <slug>/latest/.  At the end, finalize() copies latest/ →
-<slug>/archives/ and writes run_metadata.json, RUN_LOG.md, ERRORS.md, WARNINGS.md.
+The physical archive directory intentionally uses only the timestamp. This keeps
+Windows paths short while the ZIP and metadata retain the descriptive run_id.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import logging
+import os
 import platform
 import shutil
 import sys
@@ -22,10 +25,7 @@ from pathlib import Path
 from typing import Any
 
 
-# Directories that hold per-run output and must be cleaned before a fresh run
 _RUN_DIRS = ["pages", "screenshots", "discussions", "data_profile", "leaderboard"]
-
-# Directories that cache expensive downloads — only deleted with --clean-latest
 _CACHE_DIRS = ["data", "code_notebooks"]
 
 
@@ -38,13 +38,14 @@ class Archiver:
         self.base_dir = base_dir / slug
         self.started_at = datetime.now()
         self.timestamp = self.started_at.strftime("%Y%m%d_%H%M%S")
-        # run_id is the stable identifier for this run (used in headers of every file)
         self.run_id = f"{slug}_{self.timestamp}"
 
         self.latest_dir = self.base_dir / "latest"
         self.latest_dir.mkdir(parents=True, exist_ok=True)
 
-        self.archive_dir = self.base_dir / "archives" / f"{slug}_{self.timestamp}"
+        # Keep this component short. Repeating a long competition slug here can
+        # push downloaded notebook paths beyond Windows MAX_PATH.
+        self.archive_dir = self.base_dir / "archives" / self.timestamp
 
         self._log_lines: list[str] = []
         self._error_lines: list[str] = []
@@ -53,16 +54,13 @@ class Archiver:
     # ── Logging ───────────────────────────────────────────────────────────────
 
     def log(self, msg: str) -> None:
-        entry = f"[{_ts()}] {msg}"
-        self._log_lines.append(entry)
+        self._log_lines.append(f"[{_ts()}] {msg}")
 
     def error(self, msg: str) -> None:
-        entry = f"[{_ts()}] {msg}"
-        self._error_lines.append(entry)
+        self._error_lines.append(f"[{_ts()}] {msg}")
 
     def warning(self, msg: str) -> None:
-        entry = f"[{_ts()}] {msg}"
-        self._warning_lines.append(entry)
+        self._warning_lines.append(f"[{_ts()}] {msg}")
 
     # ── Run directory management ──────────────────────────────────────────────
 
@@ -72,70 +70,67 @@ class Archiver:
         keep_data: bool = True,
         keep_notebooks: bool = True,
     ) -> None:
-        """
-        Remove stale output from a previous run inside latest/.
-
-        Parameters
-        ----------
-        clean_latest_completely : If True, wipe the entire latest/ directory
-                                   (used with --clean-latest).
-        keep_data               : Keep latest/data/ (expensive re-download).
-        keep_notebooks          : Keep latest/code_notebooks/ (notebooks are cached per-slug).
-        """
-        import logging as _logging
-        log = _logging.getLogger("kaggle_collector")
+        """Remove stale run output while optionally preserving expensive caches."""
+        log = logging.getLogger("kaggle_collector")
 
         if clean_latest_completely:
             import tempfile
+
             log.info("--clean-latest: wiping entire latest/ directory …")
-            # Move precious subdirs to a temp location BEFORE wiping latest/
             preserved_tmp: dict[str, Path] = {}
-            preserve_names = (["data"] if keep_data else []) + (["code_notebooks"] if keep_notebooks else [])
+            preserve_names = (
+                (["data"] if keep_data else [])
+                + (["code_notebooks"] if keep_notebooks else [])
+            )
+
             for subdir_name in preserve_names:
                 subdir = self.latest_dir / subdir_name
-                if subdir.exists():
-                    tmp = Path(tempfile.mkdtemp(prefix=f"kcc_{subdir_name}_"))
-                    shutil.copytree(subdir, tmp / subdir_name)
-                    preserved_tmp[subdir_name] = tmp
-            # Wipe and recreate
-            shutil.rmtree(self.latest_dir)
+                if not subdir.exists():
+                    continue
+                tmp = Path(tempfile.mkdtemp(prefix=f"kcc_{subdir_name}_"))
+                shutil.copytree(
+                    _filesystem_path(subdir),
+                    _filesystem_path(tmp / subdir_name),
+                )
+                preserved_tmp[subdir_name] = tmp
+
+            if self.latest_dir.exists():
+                shutil.rmtree(_filesystem_path(self.latest_dir))
             self.latest_dir.mkdir(parents=True, exist_ok=True)
-            # Move preserved directories back
+
             for name, tmp_root in preserved_tmp.items():
-                dst = self.latest_dir / name
-                shutil.copytree(tmp_root / name, dst)
-                shutil.rmtree(tmp_root)
+                shutil.copytree(
+                    _filesystem_path(tmp_root / name),
+                    _filesystem_path(self.latest_dir / name),
+                )
+                shutil.rmtree(_filesystem_path(tmp_root))
+
             log.info(f"  latest/ recreated (preserved: {list(preserved_tmp)})")
         else:
-            # Default: clean run-generated directories. Cached directories are
-            # preserved unless the caller explicitly disables keeping them
-            # (e.g. --overwrite-cache for code_notebooks).
             for dir_name in _RUN_DIRS:
                 target = self.latest_dir / dir_name
                 if target.exists():
-                    shutil.rmtree(target)
+                    shutil.rmtree(_filesystem_path(target))
                     log.debug(f"  Cleaned stale: latest/{dir_name}/")
+
             if not keep_data:
                 target = self.latest_dir / "data"
                 if target.exists():
-                    shutil.rmtree(target)
+                    shutil.rmtree(_filesystem_path(target))
                     log.debug("  Cleaned cache: latest/data/")
+
             if not keep_notebooks:
                 target = self.latest_dir / "code_notebooks"
                 if target.exists():
-                    shutil.rmtree(target)
+                    shutil.rmtree(_filesystem_path(target))
                     log.debug("  Cleaned cache: latest/code_notebooks/")
 
-        # Write a .run_id marker so quality validator can detect stale files
         self.write_run_id_marker()
 
     def write_run_id_marker(self) -> None:
-        """Write .run_id into latest/ so any leftover file can be compared."""
-        marker = self.latest_dir / ".run_id"
-        marker.write_text(self.run_id, encoding="utf-8")
+        (self.latest_dir / ".run_id").write_text(self.run_id, encoding="utf-8")
 
     def run_id_from_dir(self) -> str:
-        """Read the run_id written by the previous invocation (or '' if absent)."""
         marker = self.latest_dir / ".run_id"
         if marker.exists():
             return marker.read_text(encoding="utf-8").strip()
@@ -144,18 +139,13 @@ class Archiver:
     # ── Cache helpers ─────────────────────────────────────────────────────────
 
     def sha256_of(self, path: Path) -> str:
-        """Return hex SHA-256 of a file."""
         h = hashlib.sha256()
-        with path.open("rb") as fh:
+        with open(_filesystem_path(path), "rb") as fh:
             for chunk in iter(lambda: fh.read(65_536), b""):
                 h.update(chunk)
         return h.hexdigest()
 
     def file_unchanged(self, path: Path) -> bool:
-        """
-        True when `path` already exists in latest/ and its content is identical
-        to what was there from the previous run (stored alongside as .sha256).
-        """
         cache_file = path.with_suffix(path.suffix + ".sha256")
         if not path.exists() or not cache_file.exists():
             return False
@@ -163,7 +153,6 @@ class Archiver:
         return stored == self.sha256_of(path)
 
     def record_hash(self, path: Path) -> None:
-        """Persist the SHA-256 of `path` next to it for future cache checks."""
         cache_file = path.with_suffix(path.suffix + ".sha256")
         cache_file.write_text(self.sha256_of(path), encoding="utf-8")
 
@@ -176,46 +165,70 @@ class Archiver:
         run_config: dict[str, Any] | None = None,
     ) -> Path:
         """
-        Write log / metadata files into latest/, copy everything to
-        archives/<slug>_<timestamp>/, then create a zip of ONLY that folder.
-        Returns the archive directory path.
+        Write metadata, create an immutable directory snapshot, and create ZIP.
+
+        Archive creation is best-effort. A Windows path problem must never turn a
+        successfully collected competition into a fatal program failure. The ZIP
+        is written directly from latest/, so it can still be produced if the
+        secondary directory copy cannot be completed.
         """
         self._flush_log_files()
         self._write_run_metadata(counters, pkg_versions, run_config or {})
 
-        if self.archive_dir.exists():
-            shutil.rmtree(self.archive_dir)
-        shutil.copytree(self.latest_dir, self.archive_dir, ignore=_ignore_sha256)
+        log = logging.getLogger("kaggle_collector")
+        archive_copy_ok = False
 
-        # Create a zip containing ONLY this run's archive folder
-        self._create_run_zip()
+        try:
+            if self.archive_dir.exists():
+                shutil.rmtree(_filesystem_path(self.archive_dir))
+            self.archive_dir.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(
+                _filesystem_path(self.latest_dir),
+                _filesystem_path(self.archive_dir),
+                ignore=_ignore_sha256,
+            )
+            archive_copy_ok = True
+        except Exception as exc:
+            warning = (
+                "Archive directory copy could not be completed; the live latest/ "
+                f"output is intact and ZIP creation will still be attempted. Reason: {exc}"
+            )
+            log.warning(warning)
+            self.warning(warning)
 
-        return self.archive_dir
+        self._create_run_zip(source_dir=self.latest_dir)
+        return self.archive_dir if archive_copy_ok else self.latest_dir
 
-    def _create_run_zip(self) -> None:
-        """
-        Zip archives/<slug>_<timestamp>/ into archives/<slug>_<timestamp>.zip.
-        The zip contains a single top-level folder named <slug>_<timestamp>/.
-        Any pre-existing .zip files with a conflicting name are removed first.
-        """
-        zip_path = self.archive_dir.parent / f"{self.archive_dir.name}.zip"
+    def _create_run_zip(self, source_dir: Path) -> Path | None:
+        """Create archives/<run_id>.zip directly from a source directory."""
+        archive_root = self.base_dir / "archives"
+        archive_root.mkdir(parents=True, exist_ok=True)
+        zip_path = archive_root / f"{self.run_id}.zip"
 
-        # Remove any existing zip with this name (could be stale from a previous run)
         if zip_path.exists():
             zip_path.unlink()
 
         try:
-            with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED, allowZip64=True) as zf:
-                for file in sorted(self.archive_dir.rglob("*")):
-                    if file.is_file():
-                        arcname = self.archive_dir.name + "/" + file.relative_to(self.archive_dir).as_posix()
-                        zf.write(file, arcname)
+            source_fs = Path(_filesystem_path(source_dir))
+            with zipfile.ZipFile(
+                _filesystem_path(zip_path),
+                "w",
+                zipfile.ZIP_DEFLATED,
+                allowZip64=True,
+            ) as zf:
+                for file in sorted(source_fs.rglob("*")):
+                    if not file.is_file() or file.name.endswith(".sha256"):
+                        continue
+                    relative = file.relative_to(source_fs).as_posix()
+                    zf.write(_filesystem_path(file), f"{self.run_id}/{relative}")
+            return zip_path
         except Exception as exc:
-            # Zip creation is best-effort — don't crash the whole run
-            import logging
-            logging.getLogger("kaggle_collector").warning(f"Could not create archive zip: {exc}")
+            warning = f"Could not create archive zip: {exc}"
+            logging.getLogger("kaggle_collector").warning(warning)
+            self.warning(warning)
+            return None
 
-    # ── Internals ─────────────────────────────────────────────────────────────
+    # ── Metadata and log files ────────────────────────────────────────────────
 
     def _flush_log_files(self) -> None:
         _write(
@@ -249,6 +262,7 @@ class Archiver:
             "competition_dir": str(self.base_dir),
             "output_latest": str(self.latest_dir),
             "archive": str(self.archive_dir),
+            "archive_zip": str(self.base_dir / "archives" / f"{self.run_id}.zip"),
             "machine": {
                 "os": platform.platform(),
                 "python_version": sys.version,
@@ -264,11 +278,6 @@ class Archiver:
         )
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Helpers
-# ──────────────────────────────────────────────────────────────────────────────
-
-
 def _ts() -> str:
     return datetime.now().strftime("%H:%M:%S")
 
@@ -278,21 +287,37 @@ def _write(path: Path, content: str) -> None:
 
 
 def _ignore_sha256(directory: str, contents: list[str]) -> list[str]:
-    """Exclude .sha256 sidecar files from the archive copy."""
-    return [f for f in contents if f.endswith(".sha256")]
+    return [name for name in contents if name.endswith(".sha256")]
+
+
+def _filesystem_path(path: Path | str) -> str:
+    """Return a Windows extended-length path when running on Windows."""
+    value = os.path.abspath(os.fspath(path))
+    if os.name != "nt" or value.startswith("\\\\?\\"):
+        return value
+    if value.startswith("\\\\"):
+        return "\\\\?\\UNC\\" + value[2:]
+    return "\\\\?\\" + value
 
 
 def collect_pkg_versions() -> dict[str, str]:
-    """Return installed versions of key packages."""
     packages = [
-        "kaggle", "playwright", "python-dotenv",
-        "markdownify", "beautifulsoup4", "pandas",
-        "pyarrow", "pyyaml", "openpyxl", "tabulate",
+        "kaggle",
+        "playwright",
+        "python-dotenv",
+        "markdownify",
+        "beautifulsoup4",
+        "pandas",
+        "pyarrow",
+        "pyyaml",
+        "openpyxl",
+        "tabulate",
     ]
     versions: dict[str, str] = {}
     for pkg in packages:
         try:
             import importlib.metadata as im
+
             versions[pkg] = im.version(pkg)
         except Exception:
             versions[pkg] = "not installed"
