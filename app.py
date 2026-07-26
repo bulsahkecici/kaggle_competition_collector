@@ -1,8 +1,4 @@
-"""Streamlit web interface for kaggle_competition_collector.
-
-Run with:
-    streamlit run app.py
-"""
+"""Streamlit web interface for kaggle_competition_collector."""
 
 from __future__ import annotations
 
@@ -19,11 +15,14 @@ from urllib.parse import urlparse
 
 import streamlit as st
 
+from collector.data_size_inspector import DatasetInspectionError, format_bytes, inspect_competition_data
+
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_OUTPUT_ROOT = PROJECT_ROOT / "competition_archive"
 TOTAL_PHASES = 9
 MAX_LOG_LINES = 500
+DEFAULT_LARGE_DATA_GB = 5.0
 
 
 def extract_competition_slug(value: str) -> str:
@@ -39,11 +38,10 @@ def extract_competition_slug(value: str) -> str:
         host = parsed.netloc.lower().split(":", 1)[0]
         if host not in {"kaggle.com", "www.kaggle.com"}:
             raise ValueError("Bağlantı kaggle.com alan adına ait olmalı.")
-
         parts = [part for part in parsed.path.split("/") if part]
         try:
-            competition_index = parts.index("competitions")
-            slug = parts[competition_index + 1]
+            index = parts.index("competitions")
+            slug = parts[index + 1]
         except (ValueError, IndexError) as exc:
             raise ValueError(
                 "Bağlantı şu biçimde olmalı: https://www.kaggle.com/competitions/yarisma-adi"
@@ -53,14 +51,12 @@ def extract_competition_slug(value: str) -> str:
 
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", slug):
         raise ValueError("Yarışma adı yalnızca harf, rakam, tire ve alt çizgi içerebilir.")
-
     return slug
 
 
 def resolve_output_root(raw_value: str) -> Path:
     if not raw_value.strip():
         return DEFAULT_OUTPUT_ROOT.resolve()
-
     expanded = os.path.expandvars(raw_value.strip())
     output_root = Path(expanded).expanduser()
     if not output_root.is_absolute():
@@ -94,7 +90,6 @@ def build_command(
         "--max-discussions",
         str(max_discussions),
     ]
-
     if not download_data:
         command.append("--no-download")
     if not collect_browser:
@@ -107,10 +102,8 @@ def build_command(
         command.append("--no-discussions")
     if not profile_data:
         command.append("--no-profile")
-
     if collect_browser:
         command.append("--headed" if headed_browser else "--headless")
-
     return command
 
 
@@ -120,16 +113,10 @@ def command_as_text(command: list[str]) -> str:
     return shlex.join(command)
 
 
-def run_collector(
-    command: list[str],
-    log_box: Any,
-    progress_bar: Any,
-    phase_box: Any,
-) -> tuple[int, str]:
+def run_collector(command: list[str], log_box: Any, progress_bar: Any, phase_box: Any) -> tuple[int, str]:
     environment = os.environ.copy()
     environment["PYTHONIOENCODING"] = "utf-8"
     environment["PYTHONUNBUFFERED"] = "1"
-
     process = subprocess.Popen(
         command,
         cwd=PROJECT_ROOT,
@@ -141,27 +128,21 @@ def run_collector(
         bufsize=1,
         env=environment,
     )
-
-    collected_lines: list[str] = []
+    lines: list[str] = []
     assert process.stdout is not None
-
     for raw_line in iter(process.stdout.readline, ""):
         line = raw_line.rstrip("\r\n")
-        collected_lines.append(line)
-
-        phase_match = re.search(r"Phase\s+(\d+)/(\d+):\s*(.+)", line)
-        if phase_match:
-            current_phase = min(int(phase_match.group(1)), TOTAL_PHASES)
-            phase_box.info(f"Aşama {current_phase}/{TOTAL_PHASES}: {phase_match.group(3)}")
-            progress_bar.progress(current_phase / TOTAL_PHASES)
-
-        log_box.code("\n".join(collected_lines[-MAX_LOG_LINES:]), language="text")
-
+        lines.append(line)
+        match = re.search(r"Phase\s+(\d+)/(\d+):\s*(.+)", line)
+        if match:
+            current = min(int(match.group(1)), TOTAL_PHASES)
+            phase_box.info(f"Aşama {current}/{TOTAL_PHASES}: {match.group(3)}")
+            progress_bar.progress(current / TOTAL_PHASES)
+        log_box.code("\n".join(lines[-MAX_LOG_LINES:]), language="text")
     return_code = process.wait()
     if return_code == 0:
         progress_bar.progress(1.0)
-
-    return return_code, "\n".join(collected_lines)
+    return return_code, "\n".join(lines)
 
 
 def read_text(path: Path) -> str:
@@ -184,40 +165,53 @@ def parse_quality_counts(report: str) -> tuple[int | None, int | None, int | Non
     )
     if not match:
         return None, None, None
-    values = tuple(int(value) for value in match.groups())
-    return values[0], values[1], values[2]
+    return tuple(int(value) for value in match.groups())  # type: ignore[return-value]
 
 
 def open_local_folder(path: Path) -> None:
     if not path.exists():
         raise FileNotFoundError(path)
-
-    system = platform.system()
-    if system == "Windows":
+    if platform.system() == "Windows":
         os.startfile(str(path))  # type: ignore[attr-defined]
-    elif system == "Darwin":
+    elif platform.system() == "Darwin":
         subprocess.Popen(["open", str(path)])
     else:
         subprocess.Popen(["xdg-open", str(path)])
 
 
-def render_run_diagnostics(result: dict[str, Any]) -> None:
-    logs = result["logs"]
-    command = result["command"]
+def render_inspection(inspection: dict[str, Any], threshold_bytes: int) -> bool:
+    total_bytes = int(inspection["total_bytes"])
+    is_large = total_bytes >= threshold_bytes
+    columns = st.columns(3)
+    columns[0].metric("Toplam veri boyutu", inspection["total_display"])
+    columns[1].metric("Dosya sayısı", inspection["file_count"])
+    largest = inspection.get("largest_file") or {}
+    columns[2].metric("En büyük dosya", largest.get("size_display", "—"))
 
-    if "--no-download" in command:
-        st.error(
-            "Bu çalıştırmada veri indirme kapalıydı. Komuta `--no-download` eklendiği için "
-            "data klasörü boş kaldı. Yeniden çalıştırırken **Veri dosyalarını indir** seçeneğini açın."
+    if largest:
+        st.caption(f"En büyük dosya: `{largest.get('name', '')}`")
+
+    with st.expander("Veri dosyalarını göster"):
+        st.dataframe(
+            [
+                {"Dosya": item["name"], "Boyut": item["size_display"]}
+                for item in inspection["files"]
+            ],
+            use_container_width=True,
+            hide_index=True,
         )
 
-    cloudflare_count = logs.lower().count("cloudflare page")
-    if cloudflare_count:
+    if is_large:
         st.error(
-            "Kaggle, görünmez (headless) tarayıcı isteklerini Cloudflare sayfasına yönlendirdi. "
-            "Yeniden çalıştırırken **Tarayıcı penceresini göster** seçeneğini açın ve açılan pencereyi "
-            "işlem bitene kadar kapatmayın."
+            f"Bu yarışmanın verisi yaklaşık **{inspection['total_display']}**. "
+            f"Belirlenen büyük veri sınırı **{format_bytes(threshold_bytes)}**."
         )
+    else:
+        st.success(
+            f"Veri boyutu **{inspection['total_display']}**. "
+            f"Büyük veri sınırı olan {format_bytes(threshold_bytes)} değerinin altında."
+        )
+    return is_large
 
 
 def render_results(result: dict[str, Any]) -> None:
@@ -233,7 +227,6 @@ def render_results(result: dict[str, Any]) -> None:
     st.divider()
     st.subheader("Son çalıştırma")
     st.caption(f"Tamamlanma zamanı: {result['completed_at']}")
-
     if result["return_code"] != 0:
         st.error(f"Toplama işlemi hata kodu {result['return_code']} ile sona erdi.")
     elif failed_count and failed_count > 0:
@@ -241,146 +234,153 @@ def render_results(result: dict[str, Any]) -> None:
     else:
         st.success("Yarışma bilgileri başarıyla toplandı.")
 
-    render_run_diagnostics(result)
+    if "--no-download" in result["command"]:
+        st.info("Bu çalıştırmada veri indirme kapalıydı.")
+    if "cloudflare page" in result["logs"].lower():
+        st.error("Kaggle/Cloudflare engeli görüldü. Görünür tarayıcı moduyla yeniden çalıştırın.")
 
-    metric_columns = st.columns(3)
-    metric_columns[0].metric("Başarılı kontrol", "—" if ok_count is None else ok_count)
-    metric_columns[1].metric("Uyarı", "—" if warning_count is None else warning_count)
-    metric_columns[2].metric("Başarısız", "—" if failed_count is None else failed_count)
+    columns = st.columns(3)
+    columns[0].metric("Başarılı kontrol", "—" if ok_count is None else ok_count)
+    columns[1].metric("Uyarı", "—" if warning_count is None else warning_count)
+    columns[2].metric("Başarısız", "—" if failed_count is None else failed_count)
 
-    st.markdown("**Çıktı klasörü**")
     st.code(str(latest_dir), language="text")
-
-    button_columns = st.columns(3)
-    if button_columns[0].button("Çıktı klasörünü aç", key=f"open-{slug}-{result['completed_at']}"):
+    buttons = st.columns(3)
+    if buttons[0].button("Çıktı klasörünü aç", key=f"open-{result['completed_at']}"):
         try:
             open_local_folder(latest_dir)
         except Exception as exc:
             st.error(f"Klasör açılamadı: {exc}")
-
     if summary_path.exists():
-        button_columns[1].download_button(
+        buttons[1].download_button(
             "Özet raporu indir",
             data=summary_path.read_bytes(),
             file_name=summary_path.name,
             mime="text/markdown",
-            key=f"summary-{slug}-{result['completed_at']}",
+            key=f"summary-{result['completed_at']}",
         )
-
     archive_path = find_latest_archive(output_root, slug)
-    if archive_path is not None:
-        button_columns[2].download_button(
+    if archive_path:
+        buttons[2].download_button(
             "Arşiv ZIP indir",
             data=archive_path.read_bytes(),
             file_name=archive_path.name,
             mime="application/zip",
-            key=f"archive-{slug}-{result['completed_at']}",
+            key=f"archive-{result['completed_at']}",
         )
 
     with st.expander("Kalite raporunu göster", expanded=True):
         st.markdown(quality_report or "Kalite raporu bulunamadı.")
-
     with st.expander("SUMMARY_REPORT.md önizlemesi"):
         st.markdown(read_text(summary_path) or "Özet rapor bulunamadı.")
-
     with st.expander("AI handoff talimatları"):
         st.markdown(read_text(handoff_path) or "AI handoff dosyası bulunamadı.")
-
     with st.expander("Çalıştırılan komut ve loglar"):
         st.code(result["command"], language="powershell")
         st.code(result["logs"], language="text")
 
 
-st.set_page_config(
-    page_title="Kaggle Competition Collector",
-    page_icon="🏁",
-    layout="wide",
-)
-
+st.set_page_config(page_title="Kaggle Competition Collector", page_icon="🏁", layout="wide")
 st.title("🏁 Kaggle Competition Collector")
 st.write(
-    "Kaggle yarışma bağlantısını yapıştırın. Uygulama yarışma sayfalarını, verileri, "
-    "notebook'ları ve tartışmaları toplayarak analiz için hazır bir klasör oluşturur."
+    "Kaggle yarışma bağlantısını yapıştırın. Önce veri boyutunu kontrol edin, ardından toplama işlemini başlatın."
 )
 
 with st.sidebar:
     st.header("Toplama seçenekleri")
-
-    download_data = st.checkbox(
-        "Veri dosyalarını indir",
-        value=True,
-        key="download_data_v3",
-        help="Kapalı olursa data klasörü boş kalır ve kalite kontrolü başarısız olabilir.",
-    )
-    collect_browser = st.checkbox("Yarışma sayfalarını tara", value=True, key="browser_v3")
-    collect_screenshots = st.checkbox("Ekran görüntülerini kaydet", value=True, key="screens_v3")
-    collect_notebooks = st.checkbox("Notebook'ları topla", value=True, key="notebooks_v3")
-    collect_discussions = st.checkbox("Tartışmaları topla", value=True, key="discussions_v3")
-    profile_data = st.checkbox("Veri profillemesi yap", value=True, key="profile_v3")
-
-    confirm_no_download = True
-    if not download_data:
-        st.error("Veri indirme kapalı. Tam paket oluşmayacak.")
-        confirm_no_download = st.checkbox(
-            "Veri indirmeden devam etmeyi onaylıyorum",
-            value=False,
-            key="confirm_no_download_v3",
+    download_data = st.checkbox("Veri dosyalarını indir", value=True, key="download_data_v4")
+    collect_browser = st.checkbox("Yarışma sayfalarını tara", value=True, key="browser_v4")
+    collect_screenshots = st.checkbox("Ekran görüntülerini kaydet", value=True, key="screens_v4")
+    collect_notebooks = st.checkbox("Notebook'ları topla", value=True, key="notebooks_v4")
+    collect_discussions = st.checkbox("Tartışmaları topla", value=True, key="discussions_v4")
+    profile_data = st.checkbox("Veri profillemesi yap", value=True, key="profile_v4")
+    max_notebooks = int(st.number_input("Maksimum notebook", 0, 100, 15, 1))
+    max_discussions = int(st.number_input("Maksimum tartışma", 0, 100, 25, 1))
+    headed_browser = st.checkbox("Tarayıcı penceresini göster", value=True, key="headed_v4")
+    large_data_gb = float(
+        st.number_input(
+            "Büyük veri uyarı sınırı (GB)",
+            min_value=0.1,
+            max_value=1000.0,
+            value=DEFAULT_LARGE_DATA_GB,
+            step=0.5,
         )
-
-    st.divider()
-    max_notebooks = int(
-        st.number_input("Maksimum notebook", min_value=0, max_value=100, value=15, step=1)
-    )
-    max_discussions = int(
-        st.number_input("Maksimum tartışma", min_value=0, max_value=100, value=25, step=1)
-    )
-
-    st.divider()
-    headed_browser = st.checkbox(
-        "Tarayıcı penceresini göster",
-        value=True,
-        key="headed_browser_v3",
-        help="Kaggle/Cloudflare engellerini azaltmak için önerilir.",
-    )
-
-    if collect_browser and not headed_browser:
-        st.warning(
-            "Headless mod Kaggle tarafından engellenebilir. Sayfalar Cloudflare hatası verirse bu seçeneği açın."
-        )
-
-    st.caption(
-        "Kaggle'a ilk tarayıcı girişini PowerShell'de `python main.py browser-login` ile yapabilirsiniz."
     )
 
 competition_url = st.text_input(
     "Kaggle yarışma bağlantısı",
-    placeholder="https://www.kaggle.com/competitions/rogii-wellbore-geology-prediction",
+    placeholder="https://www.kaggle.com/competitions/playground-series-s6e7",
 )
 output_directory = st.text_input(
     "Çıktı ana klasörü (isteğe bağlı)",
     placeholder=str(DEFAULT_OUTPUT_ROOT),
-    help="Boş bırakırsanız proje içindeki competition_archive klasörü kullanılır.",
 )
 
-start_disabled = not confirm_no_download
+try:
+    current_slug = extract_competition_slug(competition_url) if competition_url.strip() else ""
+except ValueError as exc:
+    current_slug = ""
+    st.error(str(exc))
+
+if st.session_state.get("inspection_slug") != current_slug:
+    st.session_state.pop("dataset_inspection", None)
+    st.session_state.pop("large_download_confirmed", None)
+    st.session_state["inspection_slug"] = current_slug
+
+check_clicked = st.button(
+    "Veri boyutunu kontrol et",
+    use_container_width=True,
+    disabled=not bool(current_slug),
+)
+
+if check_clicked:
+    try:
+        with st.spinner("Kaggle dosya listesi kontrol ediliyor…"):
+            st.session_state["dataset_inspection"] = inspect_competition_data(current_slug)
+            st.session_state["large_download_confirmed"] = False
+    except DatasetInspectionError as exc:
+        st.error(str(exc))
+
+inspection = st.session_state.get("dataset_inspection")
+threshold_bytes = int(large_data_gb * 1024**3)
+is_large = False
+if inspection and inspection.get("slug") == current_slug:
+    is_large = render_inspection(inspection, threshold_bytes)
+
+large_download_confirmed = False
+if download_data and is_large:
+    large_download_confirmed = st.checkbox(
+        f"{inspection['total_display']} veriyi indirmeyi onaylıyorum",
+        value=False,
+        key="large_download_confirmed",
+    )
+
+if not download_data:
+    st.info("Veri indirme kapalı; boyut kontrolü yapılabilir fakat data klasörü indirilmeyecek.")
+
+inspection_ready = bool(inspection and inspection.get("slug") == current_slug)
+can_start = bool(current_slug) and inspection_ready
+if download_data and is_large:
+    can_start = can_start and large_download_confirmed
+
 start_clicked = st.button(
     "Yarışma bilgilerini çek",
     type="primary",
     use_container_width=True,
-    disabled=start_disabled,
+    disabled=not can_start,
 )
 
-if start_disabled:
-    st.info("Başlatmak için veri indirmeyi açın veya veri olmadan devam edeceğinizi onaylayın.")
+if current_slug and not inspection_ready:
+    st.warning("Toplama işleminden önce **Veri boyutunu kontrol et** düğmesine basın.")
+elif download_data and is_large and not large_download_confirmed:
+    st.warning("Büyük veri indirmesini başlatmak için onay kutusunu işaretleyin.")
 
 if start_clicked:
     try:
-        competition_slug = extract_competition_slug(competition_url)
         output_root = resolve_output_root(output_directory)
         output_root.mkdir(parents=True, exist_ok=True)
-
         command = build_command(
-            slug=competition_slug,
+            slug=current_slug,
             output_root=output_root,
             download_data=download_data,
             collect_browser=collect_browser,
@@ -392,33 +392,25 @@ if start_clicked:
             max_notebooks=max_notebooks,
             max_discussions=max_discussions,
         )
-
         st.subheader("Toplama işlemi")
         phase_box = st.empty()
         progress_bar = st.progress(0.0)
         log_box = st.empty()
         phase_box.info("Program başlatılıyor…")
-
         return_code, logs = run_collector(command, log_box, progress_bar, phase_box)
         completed_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
         st.session_state["last_run"] = {
-            "slug": competition_slug,
+            "slug": current_slug,
             "output_root": str(output_root),
             "return_code": return_code,
             "logs": logs,
             "command": command_as_text(command),
             "completed_at": completed_at,
         }
-
         if return_code == 0:
             phase_box.success("Program tamamlandı.")
         else:
             phase_box.error("Program hata ile tamamlandı.")
-    except ValueError as exc:
-        st.error(str(exc))
-    except FileNotFoundError as exc:
-        st.error(f"Program dosyası bulunamadı: {exc}")
     except Exception as exc:
         st.exception(exc)
 
