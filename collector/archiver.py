@@ -43,15 +43,11 @@ class Archiver:
         self.latest_dir = self.base_dir / "latest"
         self.latest_dir.mkdir(parents=True, exist_ok=True)
 
-        # Keep this component short. Repeating a long competition slug here can
-        # push downloaded notebook paths beyond Windows MAX_PATH.
         self.archive_dir = self.base_dir / "archives" / self.timestamp
 
         self._log_lines: list[str] = []
         self._error_lines: list[str] = []
         self._warning_lines: list[str] = []
-
-    # ── Logging ───────────────────────────────────────────────────────────────
 
     def log(self, msg: str) -> None:
         self._log_lines.append(f"[{_ts()}] {msg}")
@@ -61,8 +57,6 @@ class Archiver:
 
     def warning(self, msg: str) -> None:
         self._warning_lines.append(f"[{_ts()}] {msg}")
-
-    # ── Run directory management ──────────────────────────────────────────────
 
     def clean_run_dirs(
         self,
@@ -136,8 +130,6 @@ class Archiver:
             return marker.read_text(encoding="utf-8").strip()
         return ""
 
-    # ── Cache helpers ─────────────────────────────────────────────────────────
-
     def sha256_of(self, path: Path) -> str:
         h = hashlib.sha256()
         with open(_filesystem_path(path), "rb") as fh:
@@ -156,24 +148,16 @@ class Archiver:
         cache_file = path.with_suffix(path.suffix + ".sha256")
         cache_file.write_text(self.sha256_of(path), encoding="utf-8")
 
-    # ── Finalization ──────────────────────────────────────────────────────────
-
     def finalize(
         self,
         counters: dict[str, Any],
         pkg_versions: dict[str, str],
         run_config: dict[str, Any] | None = None,
     ) -> Path:
-        """
-        Write metadata, create an immutable directory snapshot, and create ZIP.
-
-        Archive creation is best-effort. A Windows path problem must never turn a
-        successfully collected competition into a fatal program failure. The ZIP
-        is written directly from latest/, so it can still be produced if the
-        secondary directory copy cannot be completed.
-        """
+        """Write metadata, AI prompt, immutable snapshot, and ZIP archive."""
         self._flush_log_files()
         self._write_run_metadata(counters, pkg_versions, run_config or {})
+        self._write_ai_prompt()
 
         log = logging.getLogger("kaggle_collector")
         archive_copy_ok = False
@@ -199,8 +183,20 @@ class Archiver:
         self._create_run_zip(source_dir=self.latest_dir)
         return self.archive_dir if archive_copy_ok else self.latest_dir
 
+    def _write_ai_prompt(self) -> None:
+        try:
+            from collector.ai_prompt import write_ai_analysis_prompt
+
+            path = write_ai_analysis_prompt(self.latest_dir, self.slug)
+            logging.getLogger("kaggle_collector").info(
+                f"Ready-to-use AI prompt written: {path.name}"
+            )
+        except Exception as exc:
+            warning = f"Could not create ready-to-use AI prompt: {exc}"
+            logging.getLogger("kaggle_collector").warning(warning)
+            self.warning(warning)
+
     def _create_run_zip(self, source_dir: Path) -> Path | None:
-        """Create archives/<run_id>.zip directly from a source directory."""
         archive_root = self.base_dir / "archives"
         archive_root.mkdir(parents=True, exist_ok=True)
         zip_path = archive_root / f"{self.run_id}.zip"
@@ -227,8 +223,6 @@ class Archiver:
             logging.getLogger("kaggle_collector").warning(warning)
             self.warning(warning)
             return None
-
-    # ── Metadata and log files ────────────────────────────────────────────────
 
     def _flush_log_files(self) -> None:
         _write(
@@ -291,7 +285,6 @@ def _ignore_sha256(directory: str, contents: list[str]) -> list[str]:
 
 
 def _filesystem_path(path: Path | str) -> str:
-    """Return a Windows extended-length path when running on Windows."""
     value = os.path.abspath(os.fspath(path))
     if os.name != "nt" or value.startswith("\\\\?\\"):
         return value
