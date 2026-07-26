@@ -27,7 +27,6 @@ MAX_LOG_LINES = 500
 
 
 def extract_competition_slug(value: str) -> str:
-    """Return a Kaggle competition slug from a slug or competition URL."""
     cleaned = value.strip()
     if not cleaned:
         raise ValueError("Kaggle yarışma bağlantısını girin.")
@@ -59,7 +58,6 @@ def extract_competition_slug(value: str) -> str:
 
 
 def resolve_output_root(raw_value: str) -> Path:
-    """Resolve an optional user-supplied output directory."""
     if not raw_value.strip():
         return DEFAULT_OUTPUT_ROOT.resolve()
 
@@ -84,7 +82,6 @@ def build_command(
     max_notebooks: int,
     max_discussions: int,
 ) -> list[str]:
-    """Build the existing CLI command from UI options."""
     command = [
         sys.executable,
         str(PROJECT_ROOT / "main.py"),
@@ -123,8 +120,12 @@ def command_as_text(command: list[str]) -> str:
     return shlex.join(command)
 
 
-def run_collector(command: list[str], log_box: Any, progress_bar: Any, phase_box: Any) -> tuple[int, str]:
-    """Run main.py and stream combined stdout/stderr into the Streamlit page."""
+def run_collector(
+    command: list[str],
+    log_box: Any,
+    progress_bar: Any,
+    phase_box: Any,
+) -> tuple[int, str]:
     environment = os.environ.copy()
     environment["PYTHONIOENCODING"] = "utf-8"
     environment["PYTHONUNBUFFERED"] = "1"
@@ -154,8 +155,7 @@ def run_collector(command: list[str], log_box: Any, progress_bar: Any, phase_box
             phase_box.info(f"Aşama {current_phase}/{TOTAL_PHASES}: {phase_match.group(3)}")
             progress_bar.progress(current_phase / TOTAL_PHASES)
 
-        visible_lines = collected_lines[-MAX_LOG_LINES:]
-        log_box.code("\n".join(visible_lines), language="text")
+        log_box.code("\n".join(collected_lines[-MAX_LOG_LINES:]), language="text")
 
     return_code = process.wait()
     if return_code == 0:
@@ -184,7 +184,8 @@ def parse_quality_counts(report: str) -> tuple[int | None, int | None, int | Non
     )
     if not match:
         return None, None, None
-    return tuple(int(value) for value in match.groups())  # type: ignore[return-value]
+    values = tuple(int(value) for value in match.groups())
+    return values[0], values[1], values[2]
 
 
 def open_local_folder(path: Path) -> None:
@@ -198,6 +199,25 @@ def open_local_folder(path: Path) -> None:
         subprocess.Popen(["open", str(path)])
     else:
         subprocess.Popen(["xdg-open", str(path)])
+
+
+def render_run_diagnostics(result: dict[str, Any]) -> None:
+    logs = result["logs"]
+    command = result["command"]
+
+    if "--no-download" in command:
+        st.error(
+            "Bu çalıştırmada veri indirme kapalıydı. Komuta `--no-download` eklendiği için "
+            "data klasörü boş kaldı. Yeniden çalıştırırken **Veri dosyalarını indir** seçeneğini açın."
+        )
+
+    cloudflare_count = logs.lower().count("cloudflare page")
+    if cloudflare_count:
+        st.error(
+            "Kaggle, görünmez (headless) tarayıcı isteklerini Cloudflare sayfasına yönlendirdi. "
+            "Yeniden çalıştırırken **Tarayıcı penceresini göster** seçeneğini açın ve açılan pencereyi "
+            "işlem bitene kadar kapatmayın."
+        )
 
 
 def render_results(result: dict[str, Any]) -> None:
@@ -220,6 +240,8 @@ def render_results(result: dict[str, Any]) -> None:
         st.warning(f"İşlem tamamlandı ancak kalite raporunda {failed_count} başarısız kontrol var.")
     else:
         st.success("Yarışma bilgileri başarıyla toplandı.")
+
+    render_run_diagnostics(result)
 
     metric_columns = st.columns(3)
     metric_columns[0].metric("Başarılı kontrol", "—" if ok_count is None else ok_count)
@@ -259,12 +281,10 @@ def render_results(result: dict[str, Any]) -> None:
         st.markdown(quality_report or "Kalite raporu bulunamadı.")
 
     with st.expander("SUMMARY_REPORT.md önizlemesi"):
-        summary_text = read_text(summary_path)
-        st.markdown(summary_text if summary_text else "Özet rapor bulunamadı.")
+        st.markdown(read_text(summary_path) or "Özet rapor bulunamadı.")
 
     with st.expander("AI handoff talimatları"):
-        handoff_text = read_text(handoff_path)
-        st.markdown(handoff_text if handoff_text else "AI handoff dosyası bulunamadı.")
+        st.markdown(read_text(handoff_path) or "AI handoff dosyası bulunamadı.")
 
     with st.expander("Çalıştırılan komut ve loglar"):
         st.code(result["command"], language="powershell")
@@ -285,19 +305,27 @@ st.write(
 
 with st.sidebar:
     st.header("Toplama seçenekleri")
+
     download_data = st.checkbox(
         "Veri dosyalarını indir",
         value=True,
-        help="Kapalı olursa komuta --no-download eklenir ve data klasörü boş kalabilir.",
+        key="download_data_v3",
+        help="Kapalı olursa data klasörü boş kalır ve kalite kontrolü başarısız olabilir.",
     )
-    collect_browser = st.checkbox("Yarışma sayfalarını tara", value=True)
-    collect_screenshots = st.checkbox("Ekran görüntülerini kaydet", value=True)
-    collect_notebooks = st.checkbox("Notebook'ları topla", value=True)
-    collect_discussions = st.checkbox("Tartışmaları topla", value=True)
-    profile_data = st.checkbox("Veri profillemesi yap", value=True)
+    collect_browser = st.checkbox("Yarışma sayfalarını tara", value=True, key="browser_v3")
+    collect_screenshots = st.checkbox("Ekran görüntülerini kaydet", value=True, key="screens_v3")
+    collect_notebooks = st.checkbox("Notebook'ları topla", value=True, key="notebooks_v3")
+    collect_discussions = st.checkbox("Tartışmaları topla", value=True, key="discussions_v3")
+    profile_data = st.checkbox("Veri profillemesi yap", value=True, key="profile_v3")
 
+    confirm_no_download = True
     if not download_data:
-        st.warning("Veri indirme kapalı. Kalite raporunda data/ files başarısız görünebilir.")
+        st.error("Veri indirme kapalı. Tam paket oluşmayacak.")
+        confirm_no_download = st.checkbox(
+            "Veri indirmeden devam etmeyi onaylıyorum",
+            value=False,
+            key="confirm_no_download_v3",
+        )
 
     st.divider()
     max_notebooks = int(
@@ -310,11 +338,18 @@ with st.sidebar:
     st.divider()
     headed_browser = st.checkbox(
         "Tarayıcı penceresini göster",
-        value=False,
-        help="Giriş veya kural kabulü gerekiyorsa kullanın. Arayüz terminalden Enter alamaz.",
+        value=True,
+        key="headed_browser_v3",
+        help="Kaggle/Cloudflare engellerini azaltmak için önerilir.",
     )
+
+    if collect_browser and not headed_browser:
+        st.warning(
+            "Headless mod Kaggle tarafından engellenebilir. Sayfalar Cloudflare hatası verirse bu seçeneği açın."
+        )
+
     st.caption(
-        "Kaggle'a ilk tarayıcı girişini PowerShell'de `python main.py browser-login` ile yapın."
+        "Kaggle'a ilk tarayıcı girişini PowerShell'de `python main.py browser-login` ile yapabilirsiniz."
     )
 
 competition_url = st.text_input(
@@ -327,7 +362,16 @@ output_directory = st.text_input(
     help="Boş bırakırsanız proje içindeki competition_archive klasörü kullanılır.",
 )
 
-start_clicked = st.button("Yarışma bilgilerini çek", type="primary", use_container_width=True)
+start_disabled = not confirm_no_download
+start_clicked = st.button(
+    "Yarışma bilgilerini çek",
+    type="primary",
+    use_container_width=True,
+    disabled=start_disabled,
+)
+
+if start_disabled:
+    st.info("Başlatmak için veri indirmeyi açın veya veri olmadan devam edeceğinizi onaylayın.")
 
 if start_clicked:
     try:
